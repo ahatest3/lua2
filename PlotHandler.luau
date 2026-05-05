@@ -1,3 +1,6 @@
+--Connected Discord-GitHub
+--Discord username is Fuzzy2131
+--Roblox username is HoldGamesHolder
 local plotsFolder = game.Workspace:WaitForChild("Plots")
 local RS = game:GetService("RunService")
 local TS = game:GetService("TweenService")
