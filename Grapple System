@@ -1,0 +1,541 @@
+--Connected Discord-GitHub
+--Discord username is Fuzzy2131
+--Roblox username is HoldGamesHolder
+-- Grappling hook system
+-- This script handles the important grapple logic on the server.
+-- The client only tells the server where the player is trying to grapple.
+-- The server performs the raycast and decides whether the target is valid.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local MAX_DISTANCE = 2000
+local MIN_DISTANCE = 0
+local GRAPPLE_COOLDOWN = 0
+local PULL_SPEED = 75
+local ARRIVAL_DISTANCE = 0
+
+-- I create the RemoteEvent from the server instead of expecting it to
+-- already exist. This means the client cannot replace the event with
+-- something that behaves differently.
+local remoteFolder = ReplicatedStorage:FindFirstChild("GrappleRemotes")
+
+if not remoteFolder then
+	remoteFolder = Instance.new("Folder")
+	remoteFolder.Name = "GrappleRemotes"
+	remoteFolder.Parent = ReplicatedStorage
+end
+
+local grappleEvent = remoteFolder:FindFirstChild("Grapple")
+
+if not grappleEvent then
+	grappleEvent = Instance.new("RemoteEvent")
+	grappleEvent.Name = "Grapple"
+	grappleEvent.Parent = remoteFolder
+end
+
+local controllers = {}
+
+----------------------------------------------------------------
+-- GrappleController
+----------------------------------------------------------------
+
+local GrappleController = {}
+GrappleController.__index = GrappleController
+
+function GrappleController.new(player)
+	local self = setmetatable({}, GrappleController)
+
+	self.Player = player
+	self.Character = nil
+	self.Humanoid = nil
+	self.RootPart = nil
+
+	self.IsGrappling = false
+	self.OnCooldown = false
+
+	self.Anchor = nil
+	self.Rope = nil
+	self.PlayerAttachment = nil
+
+	self.UpdateConnection = nil
+
+	return self
+end
+
+function GrappleController:SetCharacter(character)
+	self:StopGrapple()
+
+	self.Character = character
+	self.Humanoid = character:WaitForChild("Humanoid")
+	self.RootPart = character:WaitForChild("HumanoidRootPart")
+
+	-- If the player dies while grappling, the old grapple needs
+	-- to be removed immediately instead of being left in Workspace.
+	self.Humanoid.Died:Connect(function()
+		self:StopGrapple()
+	end)
+end
+
+function GrappleController:IsAlive()
+	if not self.Character then
+		return false
+	end
+
+	if not self.Humanoid then
+		return false
+	end
+
+	if not self.RootPart then
+		return false
+	end
+
+	if self.Humanoid.Health <= 0 then
+		return false
+	end
+
+	return self.Character.Parent ~= nil
+end
+
+function GrappleController:IsPositionValid(position)
+	if typeof(position) ~= "Vector3" then
+		return false
+	end
+
+	if not self:IsAlive() then
+		return false
+	end
+
+	local difference = position - self.RootPart.Position
+	local distance = difference.Magnitude
+
+	-- The minimum distance stops the player from grappling directly
+	-- underneath themselves and creating a useless physics constraint.
+	if distance < MIN_DISTANCE then
+		return false
+	end
+
+	if distance > MAX_DISTANCE then
+		return false
+	end
+
+	return true
+end
+
+function GrappleController:FindTarget(position)
+	if not self:IsPositionValid(position) then
+		return nil
+	end
+
+	local origin = self.RootPart.Position
+	local direction = position - origin
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {self.Character}
+	params.IgnoreWater = true
+
+	-- The ray is important because the client can send any Vector3 it wants.
+	-- I don't want the client to simply say "grapple to this position" and
+	-- have the server accept it without checking whether there is actually
+	-- something there.
+	local result = workspace:Raycast(origin, direction, params)
+
+	if not result then
+		return nil
+	end
+
+	if result.Instance:IsDescendantOf(self.Character) then
+		return nil
+	end
+
+	return result
+end
+
+function GrappleController:CreateAnchor(position)
+	local anchor = Instance.new("Part")
+
+	anchor.Name = "GrappleAnchor"
+	anchor.Size = Vector3.new(0.35, 0.35, 0.35)
+	anchor.Shape = Enum.PartType.Ball
+
+	anchor.Anchored = true
+	anchor.CanCollide = false
+	anchor.CanTouch = false
+	anchor.CanQuery = false
+
+	anchor.Transparency = 1
+	anchor.Position = position
+
+	anchor.Parent = workspace
+
+	return anchor
+end
+
+function GrappleController:CreateRope(anchor)
+	local playerAttachment = Instance.new("Attachment")
+	playerAttachment.Name = "GrappleAttachment"
+
+	-- Keeping the attachment slightly above the HumanoidRootPart makes
+	-- the rope look more natural than having it originate exactly at
+	-- the character's center.
+	playerAttachment.Position = Vector3.new(0, 1, 0)
+	playerAttachment.Parent = self.RootPart
+
+	local anchorAttachment = Instance.new("Attachment")
+	anchorAttachment.Name = "AnchorAttachment"
+	anchorAttachment.Parent = anchor
+
+	local rope = Instance.new("RopeConstraint")
+
+	rope.Name = "GrappleRope"
+	rope.Attachment0 = playerAttachment
+	rope.Attachment1 = anchorAttachment
+
+	rope.Visible = true
+	rope.Thickness = 0.08
+	rope.Length = (self.RootPart.Position - anchor.Position).Magnitude
+
+	rope.Parent = self.RootPart
+
+	self.PlayerAttachment = playerAttachment
+	self.Rope = rope
+
+	return rope
+end
+
+function GrappleController:PullPlayer(targetPosition)
+	if not self:IsAlive() then
+		return
+	end
+
+	local difference = targetPosition - self.RootPart.Position
+
+	if difference.Magnitude <= ARRIVAL_DISTANCE then
+		self:StopGrapple()
+		return
+	end
+
+	local direction = difference.Unit
+
+	-- AssemblyLinearVelocity is used instead of directly changing the
+	-- character's CFrame. This lets Roblox physics continue to handle
+	-- collisions and movement while the grapple is active.
+	local currentVelocity = self.RootPart.AssemblyLinearVelocity
+
+	local desiredVelocity = direction * PULL_SPEED
+
+	self.RootPart.AssemblyLinearVelocity = currentVelocity:Lerp(
+		desiredVelocity,
+		0.15
+	)
+end
+
+function GrappleController:StartGrapple(position)
+	if self.IsGrappling then
+		return
+	end
+
+	if self.OnCooldown then
+		return
+	end
+
+	local result = self:FindTarget(position)
+
+	if not result then
+		return
+	end
+
+	self.IsGrappling = true
+	self.OnCooldown = true
+
+	local targetPosition = result.Position
+
+	self.Anchor = self:CreateAnchor(targetPosition)
+	self:CreateRope(self.Anchor)
+
+	-- CFrame.lookAt is used here to calculate the direction from the
+	-- player toward the grapple point. The resulting orientation isn't
+	-- required for the rope itself, but is useful for visual effects or
+	-- future grapple animations.
+	local grappleCFrame = CFrame.lookAt(
+		self.RootPart.Position,
+		targetPosition
+	)
+
+	local grappleDirection = grappleCFrame.LookVector
+
+	-- Give the player an initial boost in the direction of the hook.
+	self.RootPart.AssemblyLinearVelocity += grappleDirection * 20
+
+	self.UpdateConnection = RunService.Heartbeat:Connect(function()
+		if not self.IsGrappling then
+			return
+		end
+
+		if not self.Anchor then
+			self:StopGrapple()
+			return
+		end
+
+		if not self:IsAlive() then
+			self:StopGrapple()
+			return
+		end
+
+		self:PullPlayer(self.Anchor.Position)
+
+		if self.Rope then
+			local distance = (
+				self.RootPart.Position - self.Anchor.Position
+			).Magnitude
+
+			-- Updating the rope length makes it follow the player instead
+			-- of leaving a large amount of slack behind.
+			self.Rope.Length = math.max(distance, 4)
+		end
+	end)
+
+	task.delay(GRAPPLE_COOLDOWN, function()
+		self.OnCooldown = false
+	end)
+end
+
+function GrappleController:StopGrapple()
+	self.IsGrappling = false
+
+	if self.UpdateConnection then
+		self.UpdateConnection:Disconnect()
+		self.UpdateConnection = nil
+	end
+
+	if self.Rope then
+		self.Rope:Destroy()
+		self.Rope = nil
+	end
+
+	if self.PlayerAttachment then
+		self.PlayerAttachment:Destroy()
+		self.PlayerAttachment = nil
+	end
+
+	if self.Anchor then
+		self.Anchor:Destroy()
+		self.Anchor = nil
+	end
+end
+
+function GrappleController:Destroy()
+	self:StopGrapple()
+
+	self.Player = nil
+	self.Character = nil
+	self.Humanoid = nil
+	self.RootPart = nil
+end
+
+----------------------------------------------------------------
+-- Player setup
+----------------------------------------------------------------
+
+local function setupPlayer(player)
+	local controller = GrappleController.new(player)
+
+	controllers[player] = controller
+
+	local function setupCharacter(character)
+		controller:SetCharacter(character)
+	end
+
+	if player.Character then
+		setupCharacter(player.Character)
+	end
+
+	player.CharacterAdded:Connect(setupCharacter)
+end
+
+local function removePlayer(player)
+	local controller = controllers[player]
+
+	if not controller then
+		return
+	end
+
+	controller:Destroy()
+	controllers[player] = nil
+end
+
+Players.PlayerAdded:Connect(setupPlayer)
+Players.PlayerRemoving:Connect(removePlayer)
+
+for _, player in Players:GetPlayers() do
+	task.spawn(setupPlayer, player)
+end
+
+----------------------------------------------------------------
+-- Client requests
+----------------------------------------------------------------
+
+grappleEvent.OnServerEvent:Connect(function(player, action, position)
+	local controller = controllers[player]
+
+	if not controller then
+		return
+	end
+
+	if typeof(action) ~= "string" then
+		return
+	end
+
+	if action == "Start" then
+		if typeof(position) ~= "Vector3" then
+			return
+		end
+
+		controller:StartGrapple(position)
+
+	elseif action == "Stop" then
+		controller:StopGrapple()
+	end
+end)
+
+----------------------------------------------------------------
+-- Server shutdown
+----------------------------------------------------------------
+
+game:BindToClose(function()
+	for player, controller in controllers do
+		controller:Destroy()
+		controllers[player] = nil
+	end
+end)
+
+
+--// CLIENT SIDED SCRIPT
+-- Grapple client controller
+-- The client handles player input and the target the player is aiming at.
+-- It does not decide whether a grapple is valid. That check is done
+-- on the server so the client cannot bypass the grapple restrictions.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local mouse = player:GetMouse()
+
+local grappleEvent = ReplicatedStorage
+	:WaitForChild("GrappleRemotes")
+	:WaitForChild("Grapple")
+
+local character
+local grappling = false
+local mouseDown = false
+
+local MAX_CLIENT_DISTANCE = 175
+
+local function setCharacter(newCharacter)
+	character = newCharacter
+	grappling = false
+	mouseDown = false
+end
+
+setCharacter(player.Character or player.CharacterAdded:Wait())
+
+player.CharacterAdded:Connect(setCharacter)
+
+local function getRoot()
+	if not character then
+		return nil
+	end
+
+	return character:FindFirstChild("HumanoidRootPart")
+end
+
+local function getTarget()
+	local root = getRoot()
+
+	if not root then
+		return nil
+	end
+
+	local target = mouse.Hit.Position
+	local distance = (target - root.Position).Magnitude
+
+	-- This is only a client-side check to avoid sending obviously bad
+	-- requests every time the player clicks. The server performs its
+	-- own distance check and cannot trust this value.
+	if distance > MAX_CLIENT_DISTANCE then
+		return nil
+	end
+
+	return target
+end
+
+local function startGrapple()
+	if grappling then
+		return
+	end
+
+	local target = getTarget()
+
+	if not target then
+		return
+	end
+
+	grappling = true
+
+	grappleEvent:FireServer("Start", target)
+end
+
+local function stopGrapple()
+	if not grappling then
+		return
+	end
+
+	grappling = false
+
+	grappleEvent:FireServer("Stop")
+end
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then
+		return
+	end
+
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		mouseDown = true
+		startGrapple()
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		mouseDown = false
+		stopGrapple()
+	end
+end)
+
+-- If the player somehow stops holding the mouse while the character
+-- changes or becomes invalid, make sure the grapple gets released.
+RunService.Heartbeat:Connect(function()
+	if not grappling then
+		return
+	end
+
+	local root = getRoot()
+
+	if not root then
+		stopGrapple()
+		return
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+
+	if not humanoid or humanoid.Health <= 0 then
+		stopGrapple()
+	end
+end)
+
